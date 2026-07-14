@@ -12,13 +12,13 @@
 # see "nuc <- macmini", not "nuc <- 100.70.248.21". Your own connection
 # (the one sshls makes to poll each host) is excluded via $SSH_CONNECTION.
 #
-# Caveats (v0.1.0): uses `ss` on each host, so it counts regular sshd
-# connections. Hosts without `ss` are marked [no ss]; unreachable hosts
-# are marked [down]. Tailscale-SSH sessions are not counted by `ss`.
+# Each row shows the source device, the login user, and current activity.
+# Tailscale-SSH sessions are included (tagged [ts]); hosts without `ss`
+# are marked [no ss]; unreachable hosts are marked [down].
 
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 REPO="cobanov/sshls"
 
 LOCAL_ONLY=0
@@ -130,29 +130,65 @@ TAB=$'\t'
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/sshls.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
-# Remote collector (POSIX sh). Lists established connections whose LOCAL
-# port is 22 (inbound SSH), extracts the peer IP, and drops the one that
-# matches our own $SSH_CONNECTION so sshls never reports itself. Emits
-# "S<TAB>ip" per session, or "NOSS" when ss is unavailable. We base64 it
-# over the wire so no remote-shell quoting can mangle it, and so it runs
-# under sh regardless of the login shell.
+# Remote collector (POSIX sh), base64'd over the wire so no remote-shell
+# quoting can mangle it and it always runs under sh. Emits, one per line:
+#   C<TAB>ip                   a regular sshd connection (inbound :22)
+#   T<TAB>user<TAB>ip          a Tailscale-SSH session (via tailscaled)
+#   E<TAB>ip<TAB>user<TAB>what  enrichment: login user + activity per source
+#   NOSS                       ss is unavailable on this host
+# Our own polling connection is dropped: from ss by matching $SSH_CONNECTION,
+# from Tailscale-SSH by the --cmd=... that decodes this very payload.
 read -r -d '' COLLECT <<'EOF' || true
 LC_ALL=C; export LC_ALL
 sc=$SSH_CONNECTION; cip=${sc%% *}; rr=${sc#* }; cport=${rr%% *}
+
+# regular sshd connections (inbound :22), self excluded by client port
 if command -v ss >/dev/null 2>&1; then
   ss -tnH state established 2>/dev/null | while read -r rq sq loc peer; do
-    lport=${loc##*:}
-    [ "$lport" = "22" ] || continue
+    [ "${loc##*:}" = "22" ] || continue
     case "$peer" in
       \[*) ipp=${peer#\[}; ip=${ipp%%]*}; port=${ipp##*]:} ;;
       *)   ip=${peer%:*}; port=${peer##*:} ;;
     esac
     case "$ip" in ::ffff:*) ip=${ip#::ffff:} ;; esac
-    if [ "$ip" = "$cip" ] && [ "$port" = "$cport" ]; then continue; fi
-    printf 'S\t%s\n' "$ip"
+    [ "$ip" = "$cip" ] && [ "$port" = "$cport" ] && continue
+    printf 'C\t%s\n' "$ip"
   done
 else
   echo NOSS
+fi
+
+# Tailscale-SSH sessions: tailscaled forks a `be-child ssh ... --remote-ip=...`
+# per session. Skip our own, whose --cmd carries this base64 payload.
+if command -v ps >/dev/null 2>&1; then
+  ps -ww -eo args 2>/dev/null | while IFS= read -r line; do
+    case "$line" in *"be-child ssh"*) ;; *) continue ;; esac
+    case "$line" in *"base64 -d"*) continue ;; esac
+    ruser=; rip=
+    for tok in $line; do
+      case "$tok" in
+        --remote-user=*) ruser=${tok#--remote-user=} ;;
+        --remote-ip=*)   rip=${tok#--remote-ip=} ;;
+      esac
+    done
+    [ -n "$rip" ] || continue
+    printf 'T\t%s\t%s\n' "$ruser" "$rip"
+  done
+fi
+
+# Enrichment from w: local login user + current activity, keyed by source.
+# Column offsets are read from w's own header so the same parse works on the
+# Linux and macOS `w` layouts. sshd/tailscaled plumbing is normalised to "".
+if command -v w >/dev/null 2>&1; then
+  w 2>/dev/null | awk '
+    !h && /^USER/ { uU=index($0,"USER"); uT=index($0,"TTY"); uF=index($0,"FROM"); uL=index($0,"LOGIN@"); uW=index($0,"WHAT"); h=1; next }
+    h && uW>0 {
+      user=substr($0,uU,uT-uU); from=substr($0,uF,uL-uF); what=substr($0,uW);
+      gsub(/^[ \t]+|[ \t]+$/,"",user); gsub(/^[ \t]+|[ \t]+$/,"",from); gsub(/^[ \t]+|[ \t]+$/,"",what);
+      if (from=="" || from=="-" || substr(from,1,1)==":") next;
+      if (what=="-" || what ~ /sshd(-session)?:/ || what ~ /tailscaled/ || what ~ /base64 -d/) what="";
+      printf "E\t%s\t%s\t%s\n", from, user, what
+    }'
 fi
 EOF
 B64="$(printf '%s' "$COLLECT" | base64 | tr -d '\n')"
@@ -267,6 +303,24 @@ render_local() {
   printf "\n"
 }
 
+# Turn one host's raw collector output into render tuples, one per session:
+#   "kind<TAB>ip<TAB>user<TAB>what"  (kind = ssh | ts)
+# ssh sessions borrow their user/activity from the matching E (w) record;
+# ts sessions carry the Tailscale identity from their T record.
+host_sessions() {
+  awk -F'\t' '
+    $1=="E" && !(seen[$2]++) { eu[$2]=$3; ew[$2]=$4 }
+    $1=="C" { n++; k[n]="ssh"; kip[n]=$2 }
+    $1=="T" { n++; k[n]="ts";  kip[n]=$3; ku[n]=$2 }
+    END {
+      for (i=1;i<=n;i++) {
+        ip=kip[i]
+        user=(k[i]=="ts") ? ku[i] : eu[ip]
+        printf "%s\t%s\t%s\t%s\n", k[i], ip, user, ew[ip]
+      }
+    }' "$1"
+}
+
 render_fleet() {
   local hosts; hosts="$(host_list)"
   [[ -n "${hosts// }" ]] || { echo "  no hosts (pass names or add them to ~/.ssh/config)" >&2; return 1; }
@@ -275,7 +329,7 @@ render_fleet() {
   local tailnet; tailnet="$(tailnet_name)"
 
   # Fan out: poll every host in parallel. ConnectTimeout keeps unreachable
-  # hosts from stalling the whole run; we only ever parse S/NOSS/RC lines,
+  # hosts from stalling the whole run; we only ever parse C/T/E/NOSS/RC lines,
   # so locale warnings or auth banners on stderr can't corrupt the output.
   local h
   for h in $hosts; do
@@ -289,63 +343,85 @@ render_fleet() {
   done
   wait
 
-  # host-name column width
-  local hw=0
+  # First pass: resolve + aggregate every host's sessions into a rows file,
+  # so column widths are known before we print. Unreachable / empty hosts go
+  # to the idle file. Widths: host (hw), source name (sw), login user (uw).
+  local rows="$TMP/_rows" idle="$TMP/_idle"
+  : > "$rows"; : > "$idle"
+  local total=0 hosts_with=0 hw=0 sw=0 uw=0
   for h in $hosts; do (( ${#h} > hw )) && hw=${#h}; done
 
-  local sess="$TMP/_sess" idle="$TMP/_idle"
-  : > "$sess"; : > "$idle"
-  local total=0 hosts_with=0 rule_w=$(( hw + 30 ))
-
   for h in $hosts; do
-    local out="$TMP/$h.out" rc state srcs n
+    local out="$TMP/$h.out" rc state
     rc="$(grep '^RC=' "$out" 2>/dev/null | tail -1 | cut -d= -f2 || true)"
-    if [[ "${rc:-255}" != "0" ]]; then state="down"
-    elif grep -q '^NOSS$' "$out" 2>/dev/null; then state="noss"
-    else state="ok"; fi
-
-    if [[ "$state" == "ok" ]]; then
-      srcs="$(grep '^S'"$TAB" "$out" | cut -f2 || true)"
-      n="$(printf '%s\n' "$srcs" | grep -c . || true)"
+    if [[ "${rc:-255}" != "0" ]]; then
+      printf '%s\t%s\t%s\n' "$h" "down" "$C_RED" >> "$idle"; continue
+    elif grep -q '^NOSS$' "$out" 2>/dev/null; then
+      state="noss"
     else
-      n=0
+      state="ok"
     fi
 
-    if [[ "$state" == "ok" && "$n" -gt 0 ]]; then
-      hosts_with=$(( hosts_with + 1 )); total=$(( total + n ))
-      printf '%s\n' "$srcs" | sort | uniq -c | while read -r cnt ip; do
-        [[ -z "$ip" ]] && continue
-        local nm badge=""
-        nm="$(resolve_ip "$ip")"
-        (( cnt > 1 )) && badge=" ${C_DIM}×${cnt}${C_RESET}"
-        printf "  %s●%s  %s%-*s%s  %s←%s  %s%s%s\n" \
-          "$C_GREEN" "$C_RESET" "$C_BOLD" "$hw" "$h" "$C_RESET" \
-          "$C_DIM" "$C_RESET" "$C_CYAN" "$nm" "$C_RESET$badge" >> "$sess"
-      done
-    else
-      local reason col
-      case "$state" in
-        down) reason="down";        col="$C_RED" ;;
-        noss) reason="no ss";       col="$C_YELLOW" ;;
-        *)    reason="no sessions";  col="$C_GREY" ;;
-      esac
-      printf "  %s○%s  %s%-*s%s  %s%s%s\n" \
-        "$C_GREY" "$C_RESET" "$C_DIM" "$hw" "$h" "$C_RESET" \
-        "$col" "$reason" "$C_RESET" >> "$idle"
+    local agg
+    agg="$(host_sessions "$out" | while IFS=$'\t' read -r kind ip user what; do
+             [[ -z "$ip" ]] && continue
+             printf '%s\t%s\t%s\t%s\n' "$kind" "$(resolve_ip "$ip")" "$user" "$what"
+           done | LC_ALL=C sort | uniq -c)"
+
+    if [[ -z "${agg// }" ]]; then
+      if [[ "$state" == "noss" ]]; then
+        printf '%s\t%s\t%s\n' "$h" "no ss" "$C_YELLOW" >> "$idle"
+      else
+        printf '%s\t%s\t%s\n' "$h" "no sessions" "$C_GREY" >> "$idle"
+      fi
+      continue
     fi
+
+    hosts_with=$(( hosts_with + 1 ))
+    while read -r cnt rest; do
+      [[ -z "$cnt" ]] && continue
+      local kind nm user what
+      IFS=$'\t' read -r kind nm user what <<<"$rest"
+      total=$(( total + cnt ))
+      (( ${#nm} > sw )) && sw=${#nm}
+      (( ${#user} > uw )) && uw=${#user}
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$h" "$cnt" "$kind" "$nm" "$user" "$what" >> "$rows"
+    done <<<"$agg"
   done
 
   local head_plain="SSH sessions  ${tailnet}  ·  ${total} sessions / ${hosts_with} hosts"
+  local rule_w=$(( hw + sw + uw + 24 ))
+  (( ${#head_plain} > rule_w )) && rule_w=${#head_plain}
+
   printf "\n  %s%sSSH sessions%s  %s%s%s  ·  %s%s sessions%s %s/%s %s%s hosts%s   %sv%s%s\n" \
     "$C_BOLD" "$C_CYAN" "$C_RESET" "$C_DIM" "$tailnet" "$C_RESET" \
     "$C_GREEN" "$total" "$C_RESET" "$C_DIM" "$C_RESET" \
     "$C_BOLD" "$hosts_with" "$C_RESET" "$C_DIM" "$VERSION" "$C_RESET"
-  (( ${#head_plain} > rule_w )) && rule_w=${#head_plain}
   rule "$rule_w"
 
-  [[ -s "$sess" ]] && cat "$sess"
-  if [[ -s "$sess" && -s "$idle" ]]; then rule "$rule_w"; fi
-  [[ -s "$idle" ]] && cat "$idle"
+  if [[ -s "$rows" ]]; then
+    while IFS=$'\t' read -r h cnt kind nm user what; do
+      local badge="" tsb="" act
+      (( cnt > 1 )) && badge=" ${C_DIM}×${cnt}${C_RESET}"
+      [[ "$kind" == "ts" ]] && tsb=" ${C_MAGENTA}[ts]${C_RESET}"
+      if [[ -n "$what" ]]; then act="${C_DIM}${what}${C_RESET}"; else act="${C_DIM}—${C_RESET}"; fi
+      printf "  %s●%s  %s%-*s%s  %s←%s  %s%-*s%s  %s%-*s%s  %s%s%s\n" \
+        "$C_GREEN" "$C_RESET" \
+        "$C_BOLD" "$hw" "$h" "$C_RESET" \
+        "$C_DIM" "$C_RESET" \
+        "$C_CYAN" "$sw" "$nm" "$C_RESET" \
+        "$C_YELLOW" "$uw" "$user" "$C_RESET" \
+        "$act" "$tsb" "$badge"
+    done < "$rows"
+  fi
+
+  if [[ -s "$rows" && -s "$idle" ]]; then rule "$rule_w"; fi
+  if [[ -s "$idle" ]]; then
+    while IFS=$'\t' read -r h reason col; do
+      printf "  %s○%s  %s%-*s%s  %s%s%s\n" \
+        "$C_GREY" "$C_RESET" "$C_DIM" "$hw" "$h" "$C_RESET" "$col" "$reason" "$C_RESET"
+    done < "$idle"
+  fi
   printf "\n"
 }
 
