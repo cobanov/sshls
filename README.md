@@ -1,13 +1,30 @@
 # sshls
 
-A colorful, at-a-glance list of **active SSH sessions across your fleet** —
-who is connected to each machine, from where, and what they're doing.
-Where [`better-tailscale-ls`](https://github.com/cobanov/better-tailscale-ls)
-shows you the machines on your tailnet, `sshls` shows you the live edges
+A colorful, at-a-glance list of **active SSH sessions**. By default it shows
+your own machine — who is connected **in**, and where you're connected **out**
+to. Add `-r` to fan out across your fleet and see every host's sessions too.
+Companion to [`better-tailscale-ls`](https://github.com/cobanov/better-tailscale-ls):
+that shows the machines on your tailnet, `sshls` shows the live connections
 between them.
 
+Default — this machine, both directions:
+
 ```
-  SSH sessions  minotaur-banded.ts.net  ·  10 sessions / 5 hosts   v0.2.0
+  SSH  macmini  ·  5 in / 7 out   v0.3.0
+  ─────────────────────────────
+  incoming
+    ●  ←  ct100-docker
+    ●  ←  macbook      ×4
+  outgoing
+    ●  →  nuc
+    ●  →  spark        ×3
+    ●  →  white        ×3
+```
+
+`sshls -r` — every host in `~/.ssh/config`, each one's inbound sessions:
+
+```
+  SSH sessions  minotaur-banded.ts.net  ·  12 sessions / 5 hosts   v0.3.0
   ─────────────────────────────────────────────────────────────────────
   ●  spark  ←  ct100-docker   cobanov                —
   ●  spark  ←  macmini        cobanov                — ×3
@@ -20,12 +37,11 @@ between them.
   ○  nas    no ss
 ```
 
-Each row is `host ← source   user   activity`. Source addresses are resolved
-to Tailscale device names, so you read `nuc ← macmini`, not
-`nuc ← 100.70.248.21`. `[ts]` marks a Tailscale-SSH session; `×N` collapses
-several identical connections; `—` means an idle connection with no foreground
-command. The connection `sshls` itself opens to poll each host is excluded, so
-it never counts itself.
+Addresses are resolved to Tailscale device names, so you read `nuc ← macmini`,
+not `nuc ← 100.70.248.21`. `←` is inbound, `→` is outbound; `[ts]` marks a
+Tailscale-SSH session; `×N` collapses identical connections; `—` is an idle
+connection with no foreground command. The connection `sshls -r` opens to poll
+each host is excluded, so it never counts itself.
 
 ## Install
 
@@ -47,14 +63,14 @@ isn't on your PATH). Override with `PREFIX=/some/dir`.
 
 ### Dependencies
 
-- `ssh` — required. Hosts are read from your `~/.ssh/config`, so passwordless
-  access (keys / agent) to each host is what makes the fan-out work.
-- On each remote host: `ss` (part of `iproute2`) for regular connections,
-  plus `ps` and `w` for Tailscale-SSH sessions and user/activity. All three
-  ship on a standard Linux box. Hosts without `ss` are shown as `[no ss]`.
+- `ss` (Linux) or `netstat` (macOS) — to read local sockets for the default
+  view. Both are standard.
+- For `-r`: `ssh` with passwordless access to the hosts in your `~/.ssh/config`;
+  each remote host needs `ss` (regular connections) plus `ps` and `w`
+  (Tailscale-SSH sessions and user/activity). Hosts without `ss` show `[no ss]`.
 - [`tailscale`](https://tailscale.com/download) + [`jq`](https://jqlang.github.io/jq/)
-  — optional, on your local machine. Without them `sshls` still works; it just
-  prints raw IPs instead of device names.
+  — optional, on your local machine, for device-name resolution. Without them
+  `sshls` still works; it just prints raw IPs.
 
 On macOS:
 
@@ -65,9 +81,10 @@ brew install jq        # tailscale too, if you don't already have it
 ## Usage
 
 ```bash
-sshls              # SSH sessions on every host in ~/.ssh/config, busy hosts first
-sshls nuc pve      # only these hosts
-sshls -l           # local machine only (sessions coming INTO this box)
+sshls              # this machine: incoming (←) and outgoing (→) SSH, the default
+sshls -r           # also poll every host in ~/.ssh/config (remote fleet)
+sshls nuc pve      # only these remote hosts (implies -r)
+sshls -l           # this machine only (explicit; same as the default)
 sshls -w           # watch mode, refreshes every 5s
 sshls -w 2         # custom refresh interval
 sshls -u           # self-update to the latest release
@@ -75,43 +92,40 @@ sshls -V           # print version
 sshls --help
 ```
 
-By default `sshls` polls every `Host` entry in your `~/.ssh/config` (the first
-non-wildcard alias of each). Pass host names to limit the run to just those.
-
 ## How it works
 
-For each host, `sshls` runs a tiny POSIX-sh collector over SSH (shipped
-base64-encoded so no remote shell quoting can mangle it, and so it runs under
-`sh` regardless of the login shell). The collector gathers three things:
+**Default (local).** Reads this machine's established TCP sockets (`ss` on
+Linux, `netstat` on macOS). A socket whose *local* port is 22 is inbound
+(someone → you); one whose *remote* port is 22 is outbound (you → someone).
+Peers are resolved to Tailscale device names and grouped into `incoming` /
+`outgoing`.
 
-- **Regular sshd connections** — established TCP connections whose *local* port
-  is 22, via `ss`. The peer address is the source. Your own polling connection
-  is dropped by matching it against `$SSH_CONNECTION`.
-- **Tailscale-SSH sessions** — `tailscaled` forks a `be-child ssh …` process
-  per session, carrying `--remote-user` and `--remote-ip`. These never appear
-  as a port-22 socket, so they're read from the process list. The poller's own
-  session is dropped by the `--cmd=…` that decodes its base64 payload.
-- **User & activity** — from `w`, parsed by reading column offsets out of `w`'s
-  own header so the same logic works on the Linux and macOS layouts.
+**Fleet (`-r`).** For each host in `~/.ssh/config`, `sshls` runs a tiny POSIX-sh
+collector over SSH (shipped base64-encoded so no remote shell quoting can mangle
+it, and so it runs under `sh` regardless of the login shell). Per host it
+gathers:
 
-Back on your machine, peer IPs are mapped to Tailscale device names via
-`tailscale status --json`, sessions are grouped per host, deduplicated with a
-`×N` count, and rendered busy-hosts-first with idle / unreachable hosts dimmed
-below the fold.
+- **Regular sshd connections** — inbound port-22 sockets via `ss`; the poller's
+  own connection is dropped by matching `$SSH_CONNECTION`.
+- **Tailscale-SSH sessions** — `tailscaled` forks a `be-child ssh …` process per
+  session with `--remote-user`/`--remote-ip`. These never appear as a port-22
+  socket, so they're read from the process list; the poller's own session is
+  dropped by the `--cmd=…` that decodes its base64 payload.
+- **User & activity** — from `w`, parsed via `w`'s own header offsets so the
+  same logic works on the Linux and macOS layouts.
 
 Hosts are polled in parallel with a short `ConnectTimeout`, so one unreachable
-box never stalls the whole run. Only `C` / `T` / `E` / `NOSS` / `RC` marker
-lines are parsed, so locale warnings or SSH banners on a host can't corrupt the
-output.
+box never stalls the run. Only `C` / `T` / `E` / `NOSS` / `RC` marker lines are
+parsed, so locale warnings or SSH banners can't corrupt the output.
 
 ## Caveats
 
-- Reports *connections*, not logins — a source with several open connections
-  shows a `×N` badge.
-- `activity` is only visible for sessions with a foreground command on a pty;
-  idle shells, tunnels, and privilege-separation monitors show `—`.
-- Hosts without `ss` are marked `[no ss]`; unreachable hosts are marked
-  `[down]`.
+- Reports *connections*, not logins — several connections from one peer collapse
+  to a `×N` badge.
+- In fleet mode, `activity` only shows for sessions with a foreground command on
+  a pty; idle shells, tunnels, and privilege-separation monitors show `—`.
+- Fleet coverage is the hosts in `~/.ssh/config`; a connection where neither end
+  is polled is invisible. Hosts without `ss` are `[no ss]`; unreachable `[down]`.
 
 ## Uninstall
 

@@ -1,27 +1,28 @@
 #!/usr/bin/env bash
-# sshls - colorful active SSH session list across your fleet
+# sshls - colorful active SSH session list
 # Usage:
-#   sshls              show SSH sessions on all hosts in ~/.ssh/config
-#   sshls host1 host2  only these hosts
-#   sshls -l           local machine only (sessions into THIS box)
+#   sshls              SSH connections in AND out of THIS machine (default)
+#   sshls -r           also poll every host in ~/.ssh/config (remote fleet)
+#   sshls host1 host2  only these remote hosts (implies -r)
+#   sshls -l           this machine only (explicit; same as the default)
 #   sshls -w [sec]     watch mode (default 5s refresh)
 #   sshls -u           self-update to the latest release
 #   sshls -V           print version
 #
-# Sources are resolved to Tailscale device names when possible, so you
-# see "nuc <- macmini", not "nuc <- 100.70.248.21". Your own connection
-# (the one sshls makes to poll each host) is excluded via $SSH_CONNECTION.
+# Default (local) shows your own machine: who is connected IN (←) and where
+# you are connected OUT to (→). `-r` additionally polls every host in your
+# ~/.ssh/config and shows each one's inbound sessions (the fleet view).
 #
-# Each row shows the source device, the login user, and current activity.
-# Tailscale-SSH sessions are included (tagged [ts]); hosts without `ss`
-# are marked [no ss]; unreachable hosts are marked [down].
+# Addresses are resolved to Tailscale device names. In fleet mode,
+# Tailscale-SSH sessions are tagged [ts] and rows show the login user and
+# current activity; hosts without `ss` are [no ss], unreachable are [down].
 
 set -euo pipefail
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 REPO="cobanov/sshls"
 
-LOCAL_ONLY=0
+MODE="local"          # local (this machine, in+out) | remote (fleet)
 WATCH=0
 WATCH_INTERVAL=5
 ARG_HOSTS=""
@@ -29,7 +30,8 @@ ACTION=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -l|--local)   LOCAL_ONLY=1; shift ;;
+    -r|--remote)  MODE="remote"; shift ;;
+    -l|--local)   MODE="local"; shift ;;
     -w|--watch)
       WATCH=1; shift
       if [[ ${1:-} =~ ^[1-9][0-9]*$ ]]; then WATCH_INTERVAL=$1; shift; fi
@@ -42,6 +44,9 @@ while [[ $# -gt 0 ]]; do
     *)  ARG_HOSTS="$ARG_HOSTS $1"; shift ;;
   esac
 done
+
+# Naming hosts on the command line means "look at those remote hosts".
+[[ -n "${ARG_HOSTS// }" ]] && MODE="remote"
 
 command -v ssh >/dev/null || { echo "ssh not found in PATH" >&2; exit 1; }
 
@@ -235,8 +240,12 @@ tailnet_name() {
   tailscale status --json 2>/dev/null | jq -r '.MagicDNSSuffix // "fleet"'
 }
 
-# Runs the collector locally (used by -l). Falls back to netstat on macOS,
-# which has no `ss`.
+# Inspects local sockets for established SSH connections and emits:
+#   IN<TAB>ip    someone connected INTO this machine   (local port 22)
+#   OUT<TAB>ip   this machine connected OUT to a host  (remote port 22)
+# ss on Linux, netstat on macOS. If we happen to be running inside an SSH
+# session, that inbound connection ($SSH_CONNECTION) is dropped, and loopback
+# forwards (127.0.0.1 / ::1) are ignored.
 collect_local() {
   local cip="" cport=""
   if [[ -n "${SSH_CONNECTION:-}" ]]; then
@@ -244,20 +253,33 @@ collect_local() {
   fi
   if command -v ss >/dev/null 2>&1; then
     ss -tnH state established 2>/dev/null | while read -r rq sq loc peer; do
-      [[ "${loc##*:}" == "22" ]] || continue
-      local ip port
-      if [[ "$peer" == \[* ]]; then ip="${peer#\[}"; ip="${ip%%]*}"; port="${peer##*]:}"
-      else ip="${peer%:*}"; port="${peer##*:}"; fi
-      [[ "$ip" == ::ffff:* ]] && ip="${ip#::ffff:}"
-      [[ "$ip" == "$cip" && "$port" == "$cport" ]] && continue
-      printf 'S\t%s\n' "$ip"
+      local lport="${loc##*:}" pip pport
+      if [[ "$peer" == \[* ]]; then pip="${peer#\[}"; pip="${pip%%]*}"; pport="${peer##*]:}"
+      else pip="${peer%:*}"; pport="${peer##*:}"; fi
+      [[ "$pip" == ::ffff:* ]] && pip="${pip#::ffff:}"
+      [[ "$pip" == "127.0.0.1" || "$pip" == "::1" ]] && continue
+      if [[ "$lport" == "22" ]]; then
+        [[ "$pip" == "$cip" && "$pport" == "$cport" ]] && continue
+        printf 'IN\t%s\n' "$pip"
+      elif [[ "$pport" == "22" ]]; then
+        printf 'OUT\t%s\n' "$pip"
+      fi
     done
   elif command -v netstat >/dev/null 2>&1; then
-    netstat -anp tcp 2>/dev/null | awk '$6=="ESTABLISHED" && $4 ~ /\.22$/ {print $5}' \
-      | while read -r addr; do
-          local ip="${addr%.*}" port="${addr##*.}"
-          [[ "$ip" == "$cip" && "$port" == "$cport" ]] && continue
-          printf 'S\t%s\n' "$ip"
+    netstat -anp tcp 2>/dev/null | awk '
+      $6=="ESTABLISHED" {
+        lport=$4; sub(/.*\./,"",lport); lip=$4; sub(/\.[0-9]+$/,"",lip)
+        fport=$5; sub(/.*\./,"",fport); fip=$5; sub(/\.[0-9]+$/,"",fip)
+        if (fip=="127.0.0.1" || fip=="::1") next
+        if (lport=="22")      print "IN\t" fip "\t" fport
+        else if (fport=="22") print "OUT\t" fip
+      }' | while IFS=$'\t' read -r dir ip pport; do
+          if [[ "$dir" == "IN" ]]; then
+            [[ "$ip" == "$cip" && "$pport" == "$cport" ]] && continue
+            printf 'IN\t%s\n' "$ip"
+          else
+            printf 'OUT\t%s\n' "$ip"
+          fi
         done
   else
     echo NOSS
@@ -272,34 +294,66 @@ rule() {  # print a dim horizontal rule of given width
   printf "  %s%s%s\n" "$C_DIM" "$(printf '─%.0s' $(seq 1 "$w"))" "$C_RESET"
 }
 
+# Aggregate one direction of collect_local's output into "count name" lines,
+# resolving each source/target IP to its Tailscale device name first.
+agg_dir() {  # $1 = out file, $2 = IN|OUT
+  grep "^$2$TAB" "$1" 2>/dev/null | cut -f2 | while read -r ip; do
+    [[ -z "$ip" ]] && continue
+    resolve_ip "$ip"; echo
+  done | LC_ALL=C sort | uniq -c
+}
+
 render_local() {
   build_map >/dev/null
   local host; host="$(hostname -s 2>/dev/null || hostname)"
   local out="$TMP/local.out"
   collect_local > "$out" 2>/dev/null || true
 
-  local srcs n
-  srcs="$(grep '^S'"$TAB" "$out" | cut -f2 || true)"
-  n="$(printf '%s\n' "$srcs" | grep -c . || true)"
+  local in_rows out_rows nin nout
+  in_rows="$(agg_dir "$out" IN)"
+  out_rows="$(agg_dir "$out" OUT)"
+  nin="$(grep -c '^IN'"$TAB" "$out" 2>/dev/null || true)"; nin="${nin:-0}"
+  nout="$(grep -c '^OUT'"$TAB" "$out" 2>/dev/null || true)"; nout="${nout:-0}"
 
-  local head_plain="SSH  ${host}  ·  ${n} active"
-  printf "\n  %s%sSSH%s  %s%s%s  ·  %s%s active%s   %sv%s%s\n" \
+  # widest device name across both directions, for column alignment
+  local sw=0 cnt nm both
+  both="$(printf '%s\n%s\n' "$in_rows" "$out_rows")"
+  while read -r cnt nm; do
+    if [[ -n "$nm" ]] && (( ${#nm} > sw )); then sw=${#nm}; fi
+  done <<<"$both"
+
+  local head_plain="SSH  ${host}  ·  ${nin} in / ${nout} out"
+  printf "\n  %s%sSSH%s  %s%s%s  ·  %s%s in%s %s/%s %s%s out%s   %sv%s%s\n" \
     "$C_BOLD" "$C_CYAN" "$C_RESET" "$C_BOLD" "$host" "$C_RESET" \
-    "$C_GREEN" "$n" "$C_RESET" "$C_DIM" "$VERSION" "$C_RESET"
-  rule "${#head_plain}"
+    "$C_GREEN" "$nin" "$C_RESET" "$C_DIM" "$C_RESET" "$C_BLUE" "$nout" "$C_RESET" \
+    "$C_DIM" "$VERSION" "$C_RESET"
+  local rule_w=$(( sw + 14 )); (( ${#head_plain} > rule_w )) && rule_w=${#head_plain}
+  rule "$rule_w"
 
-  if [[ "$n" -eq 0 ]]; then
+  if [[ "$nin" -eq 0 && "$nout" -eq 0 ]]; then
     printf "  %sno active SSH sessions%s\n\n" "$C_DIM" "$C_RESET"
     return
   fi
-  printf '%s\n' "$srcs" | sort | uniq -c | while read -r cnt ip; do
-    [[ -z "$ip" ]] && continue
-    local nm badge=""
-    nm="$(resolve_ip "$ip")"
-    (( cnt > 1 )) && badge=" ${C_DIM}×${cnt}${C_RESET}"
-    printf "  %s●%s  %s←%s  %s%s%s%s\n" \
-      "$C_GREEN" "$C_RESET" "$C_DIM" "$C_RESET" "$C_BOLD" "$nm" "$C_RESET" "$badge"
-  done
+
+  if [[ -n "${in_rows// }" ]]; then
+    printf "  %sincoming%s\n" "$C_DIM" "$C_RESET"
+    while read -r cnt nm; do
+      [[ -z "$nm" ]] && continue
+      local badge=""; (( cnt > 1 )) && badge=" ${C_DIM}×${cnt}${C_RESET}"
+      printf "    %s●%s  %s←%s  %s%-*s%s%s\n" \
+        "$C_GREEN" "$C_RESET" "$C_DIM" "$C_RESET" "$C_BOLD" "$sw" "$nm" "$C_RESET" "$badge"
+    done <<<"$in_rows"
+  fi
+
+  if [[ -n "${out_rows// }" ]]; then
+    printf "  %soutgoing%s\n" "$C_DIM" "$C_RESET"
+    while read -r cnt nm; do
+      [[ -z "$nm" ]] && continue
+      local badge=""; (( cnt > 1 )) && badge=" ${C_DIM}×${cnt}${C_RESET}"
+      printf "    %s●%s  %s→%s  %s%-*s%s%s\n" \
+        "$C_BLUE" "$C_RESET" "$C_DIM" "$C_RESET" "$C_BOLD" "$sw" "$nm" "$C_RESET" "$badge"
+    done <<<"$out_rows"
+  fi
   printf "\n"
 }
 
@@ -426,7 +480,7 @@ render_fleet() {
 }
 
 run_once() {
-  if [[ "$LOCAL_ONLY" == 1 ]]; then render_local; else render_fleet; fi
+  if [[ "$MODE" == "local" ]]; then render_local; else render_fleet; fi
 }
 
 if [[ "$WATCH" == 1 ]]; then
