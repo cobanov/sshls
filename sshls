@@ -1,0 +1,368 @@
+#!/usr/bin/env bash
+# sshls - colorful active SSH session list across your fleet
+# Usage:
+#   sshls              show SSH sessions on all hosts in ~/.ssh/config
+#   sshls host1 host2  only these hosts
+#   sshls -l           local machine only (sessions into THIS box)
+#   sshls -w [sec]     watch mode (default 5s refresh)
+#   sshls -u           self-update to the latest release
+#   sshls -V           print version
+#
+# Sources are resolved to Tailscale device names when possible, so you
+# see "nuc <- macmini", not "nuc <- 100.70.248.21". Your own connection
+# (the one sshls makes to poll each host) is excluded via $SSH_CONNECTION.
+#
+# Caveats (v0.1.0): uses `ss` on each host, so it counts regular sshd
+# connections. Hosts without `ss` are marked [no ss]; unreachable hosts
+# are marked [down]. Tailscale-SSH sessions are not counted by `ss`.
+
+set -euo pipefail
+
+VERSION="0.1.0"
+REPO="cobanov/sshls"
+
+LOCAL_ONLY=0
+WATCH=0
+WATCH_INTERVAL=5
+ARG_HOSTS=""
+ACTION=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -l|--local)   LOCAL_ONLY=1; shift ;;
+    -w|--watch)
+      WATCH=1; shift
+      if [[ ${1:-} =~ ^[1-9][0-9]*$ ]]; then WATCH_INTERVAL=$1; shift; fi
+      ;;
+    -u|--update|--upgrade) ACTION=update; shift ;;
+    -V|--version) printf "sshls %s\n" "$VERSION"; exit 0 ;;
+    -h|--help)
+      sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*) echo "unknown arg: $1" >&2; exit 1 ;;
+    *)  ARG_HOSTS="$ARG_HOSTS $1"; shift ;;
+  esac
+done
+
+command -v ssh >/dev/null || { echo "ssh not found in PATH" >&2; exit 1; }
+
+# ANSI helpers — same palette as tsls (One Dark / Gruvbox inspired)
+if [[ -t 1 ]]; then
+  C_RESET=$'\033[0m'; C_DIM=$'\033[2m'; C_BOLD=$'\033[1m'
+  C_GREEN=$'\033[38;5;114m'; C_RED=$'\033[38;5;168m'
+  C_YELLOW=$'\033[38;5;179m'; C_BLUE=$'\033[38;5;111m'
+  C_MAGENTA=$'\033[38;5;141m'; C_CYAN=$'\033[38;5;80m'
+  C_GREY=$'\033[38;5;245m'; C_ORANGE=$'\033[38;5;215m'
+else
+  C_RESET=""; C_DIM=""; C_BOLD=""; C_GREEN=""; C_RED=""; C_YELLOW=""
+  C_BLUE=""; C_MAGENTA=""; C_CYAN=""; C_GREY=""; C_ORANGE=""
+fi
+
+resolve_self() {
+  # Follow symlinks to the real on-disk path so -u overwrites the binary,
+  # not a symlink pointing at it.
+  local p="$0"
+  while [[ -L "$p" ]]; do
+    local t; t=$(readlink "$p")
+    [[ "$t" = /* ]] && p="$t" || p="$(cd "$(dirname "$p")" && pwd)/$t"
+  done
+  printf "%s\n" "$p"
+}
+
+self_update() {
+  command -v curl >/dev/null || { echo "curl required for --update" >&2; exit 1; }
+  local self tmp tag remote dl_url
+  self=$(resolve_self)
+  tmp=$(mktemp)
+  # shellcheck disable=SC2064
+  trap "rm -f '$tmp'" EXIT
+
+  printf "\n  %scurrent:%s %s\n" "$C_DIM" "$C_RESET" "$VERSION"
+  printf "  %schecking:%s github.com/%s releases\n" "$C_DIM" "$C_RESET" "$REPO"
+
+  # Release/tag raw URLs are immutable, so the CDN always serves them fresh.
+  tag=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+        | grep -m1 '"tag_name":' \
+        | sed -E 's/.*"tag_name"[^"]*"([^"]+)".*/\1/' || true)
+
+  if [[ -z "$tag" ]]; then
+    printf "  %s✗%s could not determine latest release (no releases yet?)\n" \
+      "$C_RED" "$C_RESET" >&2
+    exit 1
+  fi
+
+  remote="${tag#v}"
+  if [[ "$remote" == "$VERSION" ]]; then
+    printf "  %s✓%s already on the latest version (%s)\n\n" \
+      "$C_GREEN" "$C_RESET" "$VERSION"
+    exit 0
+  fi
+
+  printf "  %s↑%s updating %s%s%s → %s%s%s\n" \
+    "$C_GREEN" "$C_RESET" "$C_DIM" "$VERSION" "$C_RESET" "$C_BOLD" "$remote" "$C_RESET"
+
+  dl_url="https://raw.githubusercontent.com/${REPO}/${tag}/sshls"
+  if ! curl -fsSL "$dl_url" -o "$tmp"; then
+    printf "  %s✗%s download failed: %s\n" "$C_RED" "$C_RESET" "$dl_url" >&2
+    exit 1
+  fi
+  if ! head -1 "$tmp" | grep -q '^#!/usr/bin/env bash'; then
+    printf "  %s✗%s downloaded file looks corrupted\n" "$C_RED" "$C_RESET" >&2
+    exit 1
+  fi
+
+  if [[ -w "$self" ]]; then
+    install -m 0755 "$tmp" "$self"
+  else
+    printf "  %sneed sudo to write %s%s\n" "$C_DIM" "$self" "$C_RESET"
+    sudo install -m 0755 "$tmp" "$self"
+  fi
+  printf "  %s✓%s installed v%s at %s\n\n" "$C_GREEN" "$C_RESET" "$remote" "$self"
+}
+
+# Handle self-update before we set up the scratch dir, so its EXIT trap
+# doesn't clash with the update's own temp-file cleanup.
+if [[ "$ACTION" == "update" ]]; then
+  self_update
+  exit 0
+fi
+
+TAB=$'\t'
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/sshls.XXXXXX")"
+trap 'rm -rf "$TMP"' EXIT
+
+# Remote collector (POSIX sh). Lists established connections whose LOCAL
+# port is 22 (inbound SSH), extracts the peer IP, and drops the one that
+# matches our own $SSH_CONNECTION so sshls never reports itself. Emits
+# "S<TAB>ip" per session, or "NOSS" when ss is unavailable. We base64 it
+# over the wire so no remote-shell quoting can mangle it, and so it runs
+# under sh regardless of the login shell.
+read -r -d '' COLLECT <<'EOF' || true
+LC_ALL=C; export LC_ALL
+sc=$SSH_CONNECTION; cip=${sc%% *}; rr=${sc#* }; cport=${rr%% *}
+if command -v ss >/dev/null 2>&1; then
+  ss -tnH state established 2>/dev/null | while read -r rq sq loc peer; do
+    lport=${loc##*:}
+    [ "$lport" = "22" ] || continue
+    case "$peer" in
+      \[*) ipp=${peer#\[}; ip=${ipp%%]*}; port=${ipp##*]:} ;;
+      *)   ip=${peer%:*}; port=${peer##*:} ;;
+    esac
+    case "$ip" in ::ffff:*) ip=${ip#::ffff:} ;; esac
+    if [ "$ip" = "$cip" ] && [ "$port" = "$cport" ]; then continue; fi
+    printf 'S\t%s\n' "$ip"
+  done
+else
+  echo NOSS
+fi
+EOF
+B64="$(printf '%s' "$COLLECT" | base64 | tr -d '\n')"
+
+# Host list: explicit args win, else the first non-wildcard token of every
+# `Host` line in ~/.ssh/config (deduped, order preserved).
+host_list() {
+  if [[ -n "${ARG_HOSTS// }" ]]; then
+    printf '%s\n' $ARG_HOSTS
+    return
+  fi
+  [[ -r "$HOME/.ssh/config" ]] || return
+  awk '
+    tolower($1) == "host" {
+      for (i = 2; i <= NF; i++)
+        if ($i !~ /[*?]/ && !seen[$i]++) { print $i; break }
+    }' "$HOME/.ssh/config"
+}
+
+# ip -> tailnet device name, built once from `tailscale status --json`.
+build_map() {
+  local map="$TMP/map"
+  : > "$map"
+  command -v tailscale >/dev/null || { echo "$map"; return; }
+  command -v jq >/dev/null || { echo "$map"; return; }
+  tailscale status --json 2>/dev/null | jq -r '
+    ([ .Self ] + ( .Peer // {} | to_entries | map(.value) ))[]
+    | ( (.DNSName // "") | split(".")[0] ) as $n
+    | (.TailscaleIPs // [])[]
+    | "\(.)\t" + (if $n == "" then (.HostName // "?") else $n end)
+  ' >> "$map" 2>/dev/null || true
+  echo "$map"
+}
+
+resolve_ip() {  # ip -> name (or ip if unknown)
+  local ip="$1" nm
+  nm="$(awk -F'\t' -v ip="$ip" '$1==ip{print $2; exit}' "$TMP/map" 2>/dev/null)"
+  [[ -n "$nm" ]] && printf '%s' "$nm" || printf '%s' "$ip"
+}
+
+tailnet_name() {
+  command -v tailscale >/dev/null || { echo "fleet"; return; }
+  command -v jq >/dev/null || { echo "fleet"; return; }
+  tailscale status --json 2>/dev/null | jq -r '.MagicDNSSuffix // "fleet"'
+}
+
+# Runs the collector locally (used by -l). Falls back to netstat on macOS,
+# which has no `ss`.
+collect_local() {
+  local cip="" cport=""
+  if [[ -n "${SSH_CONNECTION:-}" ]]; then
+    cip="${SSH_CONNECTION%% *}"; local r="${SSH_CONNECTION#* }"; cport="${r%% *}"
+  fi
+  if command -v ss >/dev/null 2>&1; then
+    ss -tnH state established 2>/dev/null | while read -r rq sq loc peer; do
+      [[ "${loc##*:}" == "22" ]] || continue
+      local ip port
+      if [[ "$peer" == \[* ]]; then ip="${peer#\[}"; ip="${ip%%]*}"; port="${peer##*]:}"
+      else ip="${peer%:*}"; port="${peer##*:}"; fi
+      [[ "$ip" == ::ffff:* ]] && ip="${ip#::ffff:}"
+      [[ "$ip" == "$cip" && "$port" == "$cport" ]] && continue
+      printf 'S\t%s\n' "$ip"
+    done
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -anp tcp 2>/dev/null | awk '$6=="ESTABLISHED" && $4 ~ /\.22$/ {print $5}' \
+      | while read -r addr; do
+          local ip="${addr%.*}" port="${addr##*.}"
+          [[ "$ip" == "$cip" && "$port" == "$cport" ]] && continue
+          printf 'S\t%s\n' "$ip"
+        done
+  else
+    echo NOSS
+  fi
+}
+
+rule() {  # print a dim horizontal rule of given width
+  local w="$1" cols
+  cols=$(tput cols 2>/dev/null || echo 80)
+  (( w > cols - 4 )) && w=$(( cols - 4 ))
+  (( w < 20 )) && w=20
+  printf "  %s%s%s\n" "$C_DIM" "$(printf '─%.0s' $(seq 1 "$w"))" "$C_RESET"
+}
+
+render_local() {
+  build_map >/dev/null
+  local host; host="$(hostname -s 2>/dev/null || hostname)"
+  local out="$TMP/local.out"
+  collect_local > "$out" 2>/dev/null || true
+
+  local srcs n
+  srcs="$(grep '^S'"$TAB" "$out" | cut -f2 || true)"
+  n="$(printf '%s\n' "$srcs" | grep -c . || true)"
+
+  local head_plain="SSH  ${host}  ·  ${n} active"
+  printf "\n  %s%sSSH%s  %s%s%s  ·  %s%s active%s   %sv%s%s\n" \
+    "$C_BOLD" "$C_CYAN" "$C_RESET" "$C_BOLD" "$host" "$C_RESET" \
+    "$C_GREEN" "$n" "$C_RESET" "$C_DIM" "$VERSION" "$C_RESET"
+  rule "${#head_plain}"
+
+  if [[ "$n" -eq 0 ]]; then
+    printf "  %sno active SSH sessions%s\n\n" "$C_DIM" "$C_RESET"
+    return
+  fi
+  printf '%s\n' "$srcs" | sort | uniq -c | while read -r cnt ip; do
+    [[ -z "$ip" ]] && continue
+    local nm badge=""
+    nm="$(resolve_ip "$ip")"
+    (( cnt > 1 )) && badge=" ${C_DIM}×${cnt}${C_RESET}"
+    printf "  %s●%s  %s←%s  %s%s%s%s\n" \
+      "$C_GREEN" "$C_RESET" "$C_DIM" "$C_RESET" "$C_BOLD" "$nm" "$C_RESET" "$badge"
+  done
+  printf "\n"
+}
+
+render_fleet() {
+  local hosts; hosts="$(host_list)"
+  [[ -n "${hosts// }" ]] || { echo "  no hosts (pass names or add them to ~/.ssh/config)" >&2; return 1; }
+
+  build_map >/dev/null
+  local tailnet; tailnet="$(tailnet_name)"
+
+  # Fan out: poll every host in parallel. ConnectTimeout keeps unreachable
+  # hosts from stalling the whole run; we only ever parse S/NOSS/RC lines,
+  # so locale warnings or auth banners on stderr can't corrupt the output.
+  local h
+  for h in $hosts; do
+    (
+      set +e   # ssh failing on an unreachable host must not skip the RC line
+      ssh -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new \
+          -o ServerAliveInterval=3 -o ServerAliveCountMax=2 \
+          "$h" "echo $B64 | base64 -d | sh"
+      echo "RC=$?"
+    ) > "$TMP/$h.out" 2>/dev/null &
+  done
+  wait
+
+  # host-name column width
+  local hw=0
+  for h in $hosts; do (( ${#h} > hw )) && hw=${#h}; done
+
+  local sess="$TMP/_sess" idle="$TMP/_idle"
+  : > "$sess"; : > "$idle"
+  local total=0 hosts_with=0 rule_w=$(( hw + 30 ))
+
+  for h in $hosts; do
+    local out="$TMP/$h.out" rc state srcs n
+    rc="$(grep '^RC=' "$out" 2>/dev/null | tail -1 | cut -d= -f2 || true)"
+    if [[ "${rc:-255}" != "0" ]]; then state="down"
+    elif grep -q '^NOSS$' "$out" 2>/dev/null; then state="noss"
+    else state="ok"; fi
+
+    if [[ "$state" == "ok" ]]; then
+      srcs="$(grep '^S'"$TAB" "$out" | cut -f2 || true)"
+      n="$(printf '%s\n' "$srcs" | grep -c . || true)"
+    else
+      n=0
+    fi
+
+    if [[ "$state" == "ok" && "$n" -gt 0 ]]; then
+      hosts_with=$(( hosts_with + 1 )); total=$(( total + n ))
+      printf '%s\n' "$srcs" | sort | uniq -c | while read -r cnt ip; do
+        [[ -z "$ip" ]] && continue
+        local nm badge=""
+        nm="$(resolve_ip "$ip")"
+        (( cnt > 1 )) && badge=" ${C_DIM}×${cnt}${C_RESET}"
+        printf "  %s●%s  %s%-*s%s  %s←%s  %s%s%s\n" \
+          "$C_GREEN" "$C_RESET" "$C_BOLD" "$hw" "$h" "$C_RESET" \
+          "$C_DIM" "$C_RESET" "$C_CYAN" "$nm" "$C_RESET$badge" >> "$sess"
+      done
+    else
+      local reason col
+      case "$state" in
+        down) reason="down";        col="$C_RED" ;;
+        noss) reason="no ss";       col="$C_YELLOW" ;;
+        *)    reason="no sessions";  col="$C_GREY" ;;
+      esac
+      printf "  %s○%s  %s%-*s%s  %s%s%s\n" \
+        "$C_GREY" "$C_RESET" "$C_DIM" "$hw" "$h" "$C_RESET" \
+        "$col" "$reason" "$C_RESET" >> "$idle"
+    fi
+  done
+
+  local head_plain="SSH sessions  ${tailnet}  ·  ${total} sessions / ${hosts_with} hosts"
+  printf "\n  %s%sSSH sessions%s  %s%s%s  ·  %s%s sessions%s %s/%s %s%s hosts%s   %sv%s%s\n" \
+    "$C_BOLD" "$C_CYAN" "$C_RESET" "$C_DIM" "$tailnet" "$C_RESET" \
+    "$C_GREEN" "$total" "$C_RESET" "$C_DIM" "$C_RESET" \
+    "$C_BOLD" "$hosts_with" "$C_RESET" "$C_DIM" "$VERSION" "$C_RESET"
+  (( ${#head_plain} > rule_w )) && rule_w=${#head_plain}
+  rule "$rule_w"
+
+  [[ -s "$sess" ]] && cat "$sess"
+  if [[ -s "$sess" && -s "$idle" ]]; then rule "$rule_w"; fi
+  [[ -s "$idle" ]] && cat "$idle"
+  printf "\n"
+}
+
+run_once() {
+  if [[ "$LOCAL_ONLY" == 1 ]]; then render_local; else render_fleet; fi
+}
+
+if [[ "$WATCH" == 1 ]]; then
+  trap 'tput cnorm 2>/dev/null' EXIT
+  trap 'exit 0' INT TERM
+  tput civis 2>/dev/null || true
+  while true; do
+    clear
+    run_once || true
+    printf "  %srefreshing every %ss · ctrl-c to quit%s\n" "$C_DIM" "$WATCH_INTERVAL" "$C_RESET"
+    sleep "$WATCH_INTERVAL"
+  done
+else
+  run_once
+fi
